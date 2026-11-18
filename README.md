@@ -116,6 +116,32 @@ The following sample code adds a metadata box and updates the chunk offsets in t
 
 [Sample Code: Insert Metadata and Update stco box](https://gist.github.com/sunfish-shogi/cccde016a38c66d32c07a0234368804e)
 
+### Segment Index Box (sidx)
+
+For byte-range playback of fragmented MP4 files, `WriteSidx` generates a
+Segment Index Box and inserts it in front of the media fragments. The
+sub-segments are divided on the media timeline of the reference track, and
+each reference carries both the media time and the byte range.
+
+The first video track is used as the reference track by default. Use
+`WithSidxReferenceTrack` to select another track.
+
+```go
+inputFile, _ := os.Open("input.mp4")
+outputFile, _ := os.Create("output.mp4")
+
+// use the first video track as the reference track
+err := mp4.WriteSidx(inputFile, outputFile)
+
+// or explicitly specify the reference track
+err = mp4.WriteSidx(inputFile, outputFile, mp4.WithSidxReferenceTrack(2))
+```
+
+The media payload is preserved byte for byte, and the absolute offsets kept
+by the existing addressing boxes (`tfra`, `mfro`, `stco`, `co64` and the
+`tfhd` `base_data_offset`) are updated so that they keep pointing at the
+correct media after the insertion changes the file layout.
+
 ### User-defined Boxes
 
 You can define additional box types as follows:
