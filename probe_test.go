@@ -446,3 +446,70 @@ func TestSegmentsGetMaxBitrate(t *testing.T) {
 			{TrackID: 2, Duration: 10, Size: 200},
 		}.GetMaxBitrate(2, 100))
 }
+
+func TestFormatConstraintIndicatorFlags(t *testing.T) {
+	assert.Equal(t, "", formatConstraintIndicatorFlags(0))
+	assert.Equal(t, "90", formatConstraintIndicatorFlags(0x900000000000))
+	assert.Equal(t, "B0", formatConstraintIndicatorFlags(0xb00000000000))
+	assert.Equal(t, "B0.0.0.0.0.1", formatConstraintIndicatorFlags(0xb00000000001))
+}
+
+func TestHEVCDecConfigInfoCodecString(t *testing.T) {
+	testCases := []struct {
+		name        string
+		sampleEntry string
+		info        *HEVCDecConfigInfo
+		expected    string
+	}{
+		{
+			name:        "Main profile, level 93, constraint B0",
+			sampleEntry: "hvc1",
+			info: &HEVCDecConfigInfo{
+				GeneralProfileIdc:                1,
+				GeneralProfileCompatibilityFlags: 0x60000000,
+				GeneralLevelIdc:                  93,
+				GeneralConstraintIndicatorFlags:  0xb00000000000,
+			},
+			expected: "hvc1.1.6.L93.B0",
+		},
+		{
+			name:        "Main10 profile, high tier, level 120",
+			sampleEntry: "hev1",
+			info: &HEVCDecConfigInfo{
+				GeneralProfileIdc:                2,
+				GeneralTierFlag:                  true,
+				GeneralProfileCompatibilityFlags: 0x20000000,
+				GeneralLevelIdc:                  120,
+				GeneralConstraintIndicatorFlags:  0x900000000000,
+			},
+			expected: "hev1.2.4.H120.90",
+		},
+		{
+			name:        "profile space and no constraint",
+			sampleEntry: "hvc1",
+			info: &HEVCDecConfigInfo{
+				GeneralProfileSpace:              1,
+				GeneralProfileIdc:                4,
+				GeneralProfileCompatibilityFlags: 0x00000000,
+				GeneralLevelIdc:                  150,
+			},
+			expected: "hvc1.A4.0.L150",
+		},
+		{
+			name:        "constraint with trailing zeros removed",
+			sampleEntry: "hvc1",
+			info: &HEVCDecConfigInfo{
+				GeneralProfileIdc:                1,
+				GeneralProfileCompatibilityFlags: 0x60000000,
+				GeneralLevelIdc:                  120,
+				GeneralConstraintIndicatorFlags:  0xb00000000100,
+			},
+			expected: "hvc1.1.6.L120.B0.0.0.0.1",
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.expected, tc.info.CodecString(tc.sampleEntry))
+		})
+	}
+}

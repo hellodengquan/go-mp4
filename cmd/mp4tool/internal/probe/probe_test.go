@@ -3,8 +3,10 @@ package probe
 import (
 	"io"
 	"os"
+	"path/filepath"
 	"testing"
 
+	"github.com/abema/go-mp4/internal/mp4test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -133,3 +135,43 @@ var sampleMP4YamlOutput = "" +
 	`  chunk_num: 9` + "\n" +
 	`  bitrate: 10570` + "\n" +
 	`  max_bitrate: 10632` + "\n"
+
+func TestProbeHEVC(t *testing.T) {
+	bin := mp4test.BuildHEVC(mp4test.HEVCOptions{SampleEntry: "hvc1", WithHvcC: true})
+
+	input := filepath.Join(t.TempDir(), "input.mp4")
+	require.NoError(t, os.WriteFile(input, bin, 0644))
+
+	rep, err := buildReport(mp4test.NewReader(bin))
+	require.NoError(t, err)
+	require.Len(t, rep.Tracks, 1)
+
+	tr := rep.Tracks[0]
+	assert.Equal(t, "hvc1.1.6.L120.90", tr.Codec)
+	assert.False(t, tr.Encrypted)
+	assert.Equal(t, uint16(320), tr.Width)
+	assert.Equal(t, uint16(180), tr.Height)
+	assert.Equal(t, uint8(1), *tr.ProfileIDC)
+	assert.Equal(t, uint8(120), *tr.LevelIDC)
+	assert.Equal(t, "L", *tr.Tier)
+	assert.Equal(t, uint16(4), *tr.NALLengthSize)
+	assert.Equal(t, 4, tr.RandomAccessFrameNum)
+	_ = input
+}
+
+func TestProbeEncryptedHEVC(t *testing.T) {
+	bin := mp4test.BuildHEVC(mp4test.HEVCOptions{
+		SampleEntry:    "encv",
+		OriginalFormat: "hvc1",
+		WithHvcC:       true,
+	})
+
+	rep, err := buildReport(mp4test.NewReader(bin))
+	require.NoError(t, err)
+	require.Len(t, rep.Tracks, 1)
+
+	tr := rep.Tracks[0]
+	assert.Equal(t, "hvc1.1.6.L120.90", tr.Codec)
+	assert.True(t, tr.Encrypted)
+	assert.Equal(t, 4, tr.RandomAccessFrameNum)
+}

@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 	"path"
+	"strings"
 
 	"github.com/abema/go-mp4"
 )
@@ -58,6 +59,8 @@ type track struct {
 	bandwidth   uint64
 	height      uint16
 	width       uint16
+	channels    uint16
+	codec       string
 	segments    []segment
 	outputDir   string
 	initFile    *os.File
@@ -70,6 +73,20 @@ func divide(inputFilePath, outputDir string) error {
 		return err
 	}
 	defer inputFile.Close()
+
+	// probe the input once so that the report and the playlist share the same
+	// interpretation of the codecs carried by the file
+	probedTracks := make(map[uint32]*mp4.Track, 4)
+	probeInfo, err := mp4.Probe(inputFile)
+	if err != nil {
+		// A damaged or incomplete media file must not abort the segmentation;
+		// the codec strings are simply omitted from the playlist below.
+		fmt.Printf("WARN: failed to probe codec information: %v\n", err)
+	} else {
+		for _, tr := range probeInfo.Tracks {
+			probedTracks[tr.TrackID] = tr
+		}
+	}
 
 	// generate track map
 	tracks := make(map[uint32]*track, 4)
@@ -100,6 +117,13 @@ func divide(inputFilePath, outputDir string) error {
 		mdhd := bs[0].Payload.(*mp4.Mdhd)
 		t.timescale = mdhd.Timescale
 
+		if pt, exists := probedTracks[t.id]; exists {
+			t.codec = pt.CodecString()
+			if pt.MP4A != nil {
+				t.channels = pt.MP4A.ChannelCount
+			}
+		}
+
 		bs, err = mp4.ExtractBoxWithPayload(inputFile, bi, mp4.BoxPath{mp4.BoxTypeMdia(), mp4.BoxTypeMinf(), mp4.BoxTypeStbl(), mp4.BoxTypeStsd(), mp4.StrToBoxType("avc1")})
 		if err != nil {
 			return err
@@ -109,6 +133,27 @@ func divide(inputFilePath, outputDir string) error {
 			t.trackType = trackVideo
 			t.height = avc1.Height
 			t.width = avc1.Width
+			t.outputDir = path.Join(outputDir, videoDirName)
+			tracks[t.id] = t
+			continue
+		}
+
+		// HEVC tracks use either the hvc1 or the hev1 sample entry
+		bs, err = mp4.ExtractBoxWithPayload(inputFile, bi, mp4.BoxPath{mp4.BoxTypeMdia(), mp4.BoxTypeMinf(), mp4.BoxTypeStbl(), mp4.BoxTypeStsd(), mp4.BoxTypeHvc1()})
+		if err != nil {
+			return err
+		}
+		if len(bs) == 0 {
+			bs, err = mp4.ExtractBoxWithPayload(inputFile, bi, mp4.BoxPath{mp4.BoxTypeMdia(), mp4.BoxTypeMinf(), mp4.BoxTypeStbl(), mp4.BoxTypeStsd(), mp4.BoxTypeHev1()})
+			if err != nil {
+				return err
+			}
+		}
+		if len(bs) != 0 {
+			hevc := bs[0].Payload.(*mp4.VisualSampleEntry)
+			t.trackType = trackVideo
+			t.height = hevc.Height
+			t.width = hevc.Width
 			t.outputDir = path.Join(outputDir, videoDirName)
 			tracks[t.id] = t
 			continue
@@ -364,13 +409,16 @@ func outputMasterPlaylist(filePath string, trackTypeMap map[trackType]*track) er
 	defer file.Close()
 
 	var adir string
+	var at *track
 	var vdir string
 	var vt *track
 
-	if _, exists := trackTypeMap[trackAudio]; exists {
+	if t, exists := trackTypeMap[trackAudio]; exists {
 		adir = audioDirName
-	} else if _, exists := trackTypeMap[trackEncAudio]; exists {
+		at = t
+	} else if t, exists := trackTypeMap[trackEncAudio]; exists {
 		adir = encAudioDirName
+		at = t
 	}
 
 	if t, exists := trackTypeMap[trackVideo]; exists {
@@ -383,13 +431,39 @@ func outputMasterPlaylist(filePath string, trackTypeMap map[trackType]*track) er
 
 	file.WriteString("#EXTM3U\n")
 	if adir != "" {
-		file.WriteString("#EXT-X-MEDIA:TYPE=AUDIO,URI=\"" + adir + "/" + playlistFileName + "\",GROUP-ID=\"audio\",NAME=\"audio\",AUTOSELECT=YES,CHANNELS=\"2\"\n")
+		file.WriteString("#EXT-X-MEDIA:TYPE=AUDIO,URI=\"" + adir + "/" + playlistFileName + "\",GROUP-ID=\"audio\",NAME=\"audio\",AUTOSELECT=YES")
+		if at.channels != 0 {
+			_, err = fmt.Fprintf(file, ",CHANNELS=\"%d\"", at.channels)
+			if err != nil {
+				return err
+			}
+		}
+		file.WriteString("\n")
 	}
 	if vdir != "" {
-		_, err = fmt.Fprintf(file, "#EXT-X-STREAM-INF:BANDWIDTH=%d,CODECS=\"avc1.64001f,mp4a.40.2\",RESOLUTION=%dx%d", // FIXME: hard coding
-			vt.bandwidth, vt.width, vt.height)
+		// CODECS carries the codec strings probed from the actual sample
+		// entries.  A codec whose profile information could not be read is
+		// left out instead of being advertised with a made up value.
+		codecs := make([]string, 0, 2)
+		if isCompleteCodecString(vt.codec) {
+			codecs = append(codecs, vt.codec)
+		}
+		if at != nil && isCompleteCodecString(at.codec) {
+			codecs = append(codecs, at.codec)
+		}
+		_, err = fmt.Fprintf(file, "#EXT-X-STREAM-INF:BANDWIDTH=%d", vt.bandwidth)
 		if err != nil {
 			return err
+		}
+		if len(codecs) != 0 {
+			if _, err = fmt.Fprintf(file, ",CODECS=\"%s\"", strings.Join(codecs, ",")); err != nil {
+				return err
+			}
+		}
+		if vt.width != 0 && vt.height != 0 {
+			if _, err = fmt.Fprintf(file, ",RESOLUTION=%dx%d", vt.width, vt.height); err != nil {
+				return err
+			}
 		}
 		if adir != "" {
 			file.WriteString(",AUDIO=\"audio\"")
@@ -398,6 +472,14 @@ func outputMasterPlaylist(filePath string, trackTypeMap map[trackType]*track) er
 		file.WriteString(vdir + "/" + playlistFileName + "\n")
 	}
 	return nil
+}
+
+// isCompleteCodecString reports whether a codec string carries the profile
+// information required by HLS.  A bare sample entry name means that the
+// decoder configuration was missing, and advertising it in CODECS would claim
+// media attributes that were never read from the file.
+func isCompleteCodecString(codec string) bool {
+	return strings.Contains(codec, ".")
 }
 
 func outputMediaPlaylist(filePath string, segments []segment) error {

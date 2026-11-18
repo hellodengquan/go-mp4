@@ -3,7 +3,10 @@ package mp4
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
+	"math/bits"
+	"strings"
 
 	"github.com/abema/go-mp4/internal/bitio"
 )
@@ -37,7 +40,14 @@ type Track struct {
 	Samples   Samples
 	Chunks    Chunks
 	AVC       *AVCDecConfigInfo
+	HEVC      *HEVCDecConfigInfo
 	MP4A      *MP4AInfo
+
+	// sampleEntry is the effective sample entry of the video track.  For an
+	// encrypted track it is the original format taken from the frma box, so
+	// that the codec string describes the actual codec and not the
+	// protection scheme.
+	sampleEntry [4]byte
 }
 
 type Codec int
@@ -46,6 +56,7 @@ const (
 	CodecUnknown Codec = iota
 	CodecAVC1
 	CodecMP4A
+	CodecHEVC
 )
 
 type EditList []*EditListEntry
@@ -78,6 +89,30 @@ type AVCDecConfigInfo struct {
 	LengthSize           uint16
 	Width                uint16
 	Height               uint16
+}
+
+// HEVCDecConfigInfo contains the HEVC decoder configuration derived from the
+// hvcC box defined in ISO/IEC 14496-15.
+type HEVCDecConfigInfo struct {
+	ConfigurationVersion             uint8
+	GeneralProfileSpace              uint8
+	GeneralTierFlag                  bool
+	GeneralProfileIdc                uint8
+	GeneralProfileCompatibilityFlags uint32
+	GeneralConstraintIndicatorFlags  uint64
+	GeneralLevelIdc                  uint8
+	MinSpatialSegmentationIdc        uint16
+	ParallelismType                  uint8
+	ChromaFormatIdc                  uint8
+	BitDepthLumaMinus8               uint8
+	BitDepthChromaMinus8             uint8
+	AvgFrameRate                     uint16
+	ConstantFrameRate                uint8
+	NumTemporalLayers                uint8
+	TemporalIdNested                 uint8
+	LengthSize                       uint16
+	Width                            uint16
+	Height                           uint16
 }
 
 type MP4AInfo struct {
@@ -193,8 +228,14 @@ func probeTrak(r io.ReadSeeker, bi *BoxInfo) (*Track, error) {
 		{BoxTypeMdia(), BoxTypeMdhd()},
 		{BoxTypeMdia(), BoxTypeMinf(), BoxTypeStbl(), BoxTypeStsd(), BoxTypeAvc1()},
 		{BoxTypeMdia(), BoxTypeMinf(), BoxTypeStbl(), BoxTypeStsd(), BoxTypeAvc1(), BoxTypeAvcC()},
+		{BoxTypeMdia(), BoxTypeMinf(), BoxTypeStbl(), BoxTypeStsd(), BoxTypeHvc1()},
+		{BoxTypeMdia(), BoxTypeMinf(), BoxTypeStbl(), BoxTypeStsd(), BoxTypeHvc1(), BoxTypeHvcC()},
+		{BoxTypeMdia(), BoxTypeMinf(), BoxTypeStbl(), BoxTypeStsd(), BoxTypeHev1()},
+		{BoxTypeMdia(), BoxTypeMinf(), BoxTypeStbl(), BoxTypeStsd(), BoxTypeHev1(), BoxTypeHvcC()},
 		{BoxTypeMdia(), BoxTypeMinf(), BoxTypeStbl(), BoxTypeStsd(), BoxTypeEncv()},
 		{BoxTypeMdia(), BoxTypeMinf(), BoxTypeStbl(), BoxTypeStsd(), BoxTypeEncv(), BoxTypeAvcC()},
+		{BoxTypeMdia(), BoxTypeMinf(), BoxTypeStbl(), BoxTypeStsd(), BoxTypeEncv(), BoxTypeHvcC()},
+		{BoxTypeMdia(), BoxTypeMinf(), BoxTypeStbl(), BoxTypeStsd(), BoxTypeEncv(), BoxTypeSinf(), BoxTypeFrma()},
 		{BoxTypeMdia(), BoxTypeMinf(), BoxTypeStbl(), BoxTypeStsd(), BoxTypeMp4a()},
 		{BoxTypeMdia(), BoxTypeMinf(), BoxTypeStbl(), BoxTypeStsd(), BoxTypeMp4a(), BoxTypeEsds()},
 		{BoxTypeMdia(), BoxTypeMinf(), BoxTypeStbl(), BoxTypeStsd(), BoxTypeMp4a(), BoxTypeWave(), BoxTypeEsds()},
@@ -214,7 +255,11 @@ func probeTrak(r io.ReadSeeker, bi *BoxInfo) (*Track, error) {
 	var elst *Elst
 	var mdhd *Mdhd
 	var avc1 *VisualSampleEntry
+	var hevcSampleEntry *VisualSampleEntry
+	var encv *VisualSampleEntry
 	var avcC *AVCDecoderConfiguration
+	var hvcC *HvcC
+	var frma *Frma
 	var audioSampleEntry *AudioSampleEntry
 	var esds *Esds
 	var stco *Stco
@@ -232,12 +277,18 @@ func probeTrak(r io.ReadSeeker, bi *BoxInfo) (*Track, error) {
 		case BoxTypeMdhd():
 			mdhd = bip.Payload.(*Mdhd)
 		case BoxTypeAvc1():
-			track.Codec = CodecAVC1
 			avc1 = bip.Payload.(*VisualSampleEntry)
+		case BoxTypeHvc1(), BoxTypeHev1():
+			hevcSampleEntry = bip.Payload.(*VisualSampleEntry)
+			track.sampleEntry = bip.Info.Type
 		case BoxTypeAvcC():
 			avcC = bip.Payload.(*AVCDecoderConfiguration)
+		case BoxTypeHvcC():
+			hvcC = bip.Payload.(*HvcC)
+		case BoxTypeFrma():
+			frma = bip.Payload.(*Frma)
 		case BoxTypeEncv():
-			track.Codec = CodecAVC1
+			encv = bip.Payload.(*VisualSampleEntry)
 			track.Encrypted = true
 		case BoxTypeMp4a():
 			track.Codec = CodecMP4A
@@ -285,6 +336,38 @@ func probeTrak(r io.ReadSeeker, bi *BoxInfo) (*Track, error) {
 	track.Timescale = mdhd.Timescale
 	track.Duration = mdhd.GetDuration()
 
+	switch {
+	case avc1 != nil:
+		// A plain AVC sample entry always describes an AVC track.
+		track.Codec = CodecAVC1
+		track.sampleEntry = BoxTypeAvc1()
+	case hevcSampleEntry != nil:
+		// hvc1 and hev1 both carry a HEVC track. The sample entry is kept
+		// verbatim because the codec string must match it.
+		track.Codec = CodecHEVC
+	case encv != nil:
+		// An encrypted visual sample entry hides the original format. It is
+		// given by the frma box; without frma the presence of a decoder
+		// configuration box is used as a fallback. When neither identifies the
+		// codec the track is left unknown instead of being claimed as AVC.
+		sampleEntry := encvFormat(frma)
+		if sampleEntry == BoxTypeAny() {
+			switch {
+			case hvcC != nil:
+				sampleEntry = BoxTypeHvc1()
+			case avcC != nil:
+				sampleEntry = BoxTypeAvc1()
+			}
+		}
+		track.sampleEntry = sampleEntry
+		switch sampleEntry {
+		case BoxTypeHvc1(), BoxTypeHev1():
+			track.Codec = CodecHEVC
+		case BoxTypeAvc1():
+			track.Codec = CodecAVC1
+		}
+	}
+
 	if avc1 != nil && avcC != nil {
 		track.AVC = &AVCDecConfigInfo{
 			ConfigurationVersion: avcC.ConfigurationVersion,
@@ -294,6 +377,16 @@ func probeTrak(r io.ReadSeeker, bi *BoxInfo) (*Track, error) {
 			LengthSize:           uint16(avcC.LengthSizeMinusOne) + 1,
 			Width:                avc1.Width,
 			Height:               avc1.Height,
+		}
+	}
+
+	if track.Codec == CodecHEVC && hvcC != nil {
+		visualSampleEntry := hevcSampleEntry
+		if visualSampleEntry == nil {
+			visualSampleEntry = encv
+		}
+		if visualSampleEntry != nil {
+			track.HEVC = newHEVCDecConfigInfo(hvcC, visualSampleEntry)
 		}
 	}
 
@@ -378,6 +471,153 @@ func probeTrak(r io.ReadSeeker, bi *BoxInfo) (*Track, error) {
 	}
 
 	return track, nil
+}
+
+// encvFormat returns the original format recorded in a frma box.  It returns
+// BoxTypeAny() when the encrypted sample entry carries no usable frma box.
+func encvFormat(frma *Frma) BoxType {
+	if frma == nil {
+		return BoxTypeAny()
+	}
+	return frma.DataFormat
+}
+
+// newHEVCDecConfigInfo converts an hvcC box into the probe representation.
+func newHEVCDecConfigInfo(hvcC *HvcC, sampleEntry *VisualSampleEntry) *HEVCDecConfigInfo {
+	var profileCompatibilityFlags uint32
+	for i, flag := range hvcC.GeneralProfileCompatibility {
+		if flag {
+			// The flags are read as a bit string in bitstream order, which is
+			// the reverse of the numeric order used by the codec string.
+			profileCompatibilityFlags |= 1 << uint(31-i)
+		}
+	}
+	var constraintIndicatorFlags uint64
+	for _, b := range hvcC.GeneralConstraintIndicator {
+		constraintIndicatorFlags = (constraintIndicatorFlags << 8) | uint64(b)
+	}
+	return &HEVCDecConfigInfo{
+		ConfigurationVersion:             hvcC.ConfigurationVersion,
+		GeneralProfileSpace:              hvcC.GeneralProfileSpace,
+		GeneralTierFlag:                  hvcC.GeneralTierFlag,
+		GeneralProfileIdc:                hvcC.GeneralProfileIdc,
+		GeneralProfileCompatibilityFlags: profileCompatibilityFlags,
+		GeneralConstraintIndicatorFlags:  constraintIndicatorFlags,
+		GeneralLevelIdc:                  hvcC.GeneralLevelIdc,
+		MinSpatialSegmentationIdc:        hvcC.MinSpatialSegmentationIdc,
+		ParallelismType:                  hvcC.ParallelismType,
+		ChromaFormatIdc:                  hvcC.ChromaFormatIdc,
+		BitDepthLumaMinus8:               hvcC.BitDepthLumaMinus8,
+		BitDepthChromaMinus8:             hvcC.BitDepthChromaMinus8,
+		AvgFrameRate:                     hvcC.AvgFrameRate,
+		ConstantFrameRate:                hvcC.ConstantFrameRate,
+		NumTemporalLayers:                hvcC.NumTemporalLayers,
+		TemporalIdNested:                 hvcC.TemporalIdNested,
+		LengthSize:                       uint16(hvcC.LengthSizeMinusOne) + 1,
+		Width:                            sampleEntry.Width,
+		Height:                           sampleEntry.Height,
+	}
+}
+
+// CodecString returns the codec string of the track as defined by
+// ISO/IEC 14496-15 and RFC 6381.  It returns an empty string when the codec
+// cannot be represented, so that the missing information is never mistaken for
+// a valid media attribute.
+func (track *Track) CodecString() string {
+	switch track.Codec {
+	case CodecAVC1:
+		if track.AVC == nil {
+			return string(track.sampleEntry[:])
+		}
+		return fmt.Sprintf("avc1.%02X%02X%02X",
+			track.AVC.Profile,
+			track.AVC.ProfileCompatibility,
+			track.AVC.Level,
+		)
+	case CodecHEVC:
+		if track.HEVC == nil {
+			return string(track.sampleEntry[:])
+		}
+		return track.HEVC.CodecString(sampleEntryName(track.sampleEntry))
+	case CodecMP4A:
+		if track.MP4A == nil || track.MP4A.OTI == 0 {
+			return "mp4a"
+		} else if track.MP4A.AudOTI == 0 {
+			return fmt.Sprintf("mp4a.%X", track.MP4A.OTI)
+		}
+		return fmt.Sprintf("mp4a.%X.%d", track.MP4A.OTI, track.MP4A.AudOTI)
+	default:
+		return ""
+	}
+}
+
+// CodecString returns the RFC 6381 codec string of the HEVC decoder
+// configuration with the given sample entry name ("hvc1" or "hev1").
+func (info *HEVCDecConfigInfo) CodecString(sampleEntry string) string {
+	if sampleEntry == "" {
+		sampleEntry = "hvc1"
+	}
+	var profileSpace string
+	switch info.GeneralProfileSpace {
+	case 0:
+		// no prefix
+	case 1:
+		profileSpace = "A"
+	case 2:
+		profileSpace = "B"
+	case 3:
+		profileSpace = "C"
+	}
+
+	profile := fmt.Sprintf("%s%d", profileSpace, info.GeneralProfileIdc)
+	compatibility := fmt.Sprintf("%X", bits.Reverse32(info.GeneralProfileCompatibilityFlags))
+
+	tier := "L"
+	if info.GeneralTierFlag {
+		tier = "H"
+	}
+	level := fmt.Sprintf("%s%d", tier, info.GeneralLevelIdc)
+
+	constraint := formatConstraintIndicatorFlags(info.GeneralConstraintIndicatorFlags)
+	if constraint != "" {
+		constraint = "." + constraint
+	}
+	return fmt.Sprintf("%s.%s.%s.%s%s", sampleEntry, profile, compatibility, level, constraint)
+}
+
+// formatConstraintIndicatorFlags encodes the 48 constraint indicator bits as
+// dot separated hex bytes, omitting trailing zero bytes.
+func formatConstraintIndicatorFlags(flags uint64) string {
+	const numBytes = 6
+	n := numBytes
+	for i := 0; i < numBytes-1; i++ {
+		if flags&0xff == 0 {
+			flags >>= 8
+			n--
+		} else {
+			break
+		}
+	}
+	if flags == 0 {
+		return ""
+	}
+	bytes := make([]string, 0, n)
+	for i := n - 1; i >= 0; i-- {
+		bytes = append(bytes, fmt.Sprintf("%X", (flags>>(uint(i)*8))&0xff))
+	}
+	return strings.Join(bytes, ".")
+}
+
+// sampleEntryName returns the sample entry name to use in an HEVC codec
+// string.  An unknown sample entry falls back to hvc1, the stricter of the two
+// HEVC sample entry types.
+func sampleEntryName(sampleEntry [4]byte) string {
+	switch sampleEntry {
+	case BoxTypeHvc1(), BoxTypeHev1():
+		return string(sampleEntry[:])
+	default:
+		return "hvc1"
+	}
 }
 
 func detectAACProfile(esds *Esds) (oti, audOTI uint8, err error) {
@@ -596,12 +836,45 @@ func probeTraf(r io.ReadSeeker, bi *BoxInfo) (*Segment, error) {
 	return segment, nil
 }
 
+// FindIDRFrames returns the indexes of the samples that contain an IDR frame
+// of an AVC track.  For HEVC tracks it returns the samples that contain an
+// independently decodable random access picture; see
+// FindRandomAccessFrames for details.
 func FindIDRFrames(r io.ReadSeeker, trackInfo *TrackInfo) ([]int, error) {
+	if trackInfo.HEVC != nil {
+		return FindRandomAccessFrames(r, trackInfo)
+	}
 	if trackInfo.AVC == nil {
 		return nil, nil
 	}
-	lengthSize := uint32(trackInfo.AVC.LengthSize)
+	return findNALUFrames(r, trackInfo, uint32(trackInfo.AVC.LengthSize), func(nalHeader byte) bool {
+		return nalHeader&0x1f == 5 // IDR
+	})
+}
 
+// FindRandomAccessFrames returns the indexes of the samples that start with an
+// independently decodable random access picture of an HEVC track.  An HEVC NAL
+// unit has a two byte header whose first byte carries the six bit nal_unit_type.
+// Random access is provided by the IRAP pictures, i.e. the BLA (16-18), IDR
+// (19-20) and CRA (21) types, including the reserved IRAP types 22 and 23.
+// Parameter sets and other non-VCL NAL units are never reported.
+func FindRandomAccessFrames(r io.ReadSeeker, trackInfo *TrackInfo) ([]int, error) {
+	if trackInfo.HEVC == nil {
+		return nil, nil
+	}
+	return findNALUFrames(r, trackInfo, uint32(trackInfo.HEVC.LengthSize), func(nalHeader byte) bool {
+		nalType := (nalHeader >> 1) & 0x3f
+		return nalType >= 16 && nalType <= 23
+	})
+}
+
+// findNALUFrames scans the length prefixed NAL units of every sample and
+// returns the sample indexes for which isRandomAccess reports true.
+func findNALUFrames(r io.ReadSeeker, trackInfo *TrackInfo, lengthSize uint32, isRandomAccess func(nalHeader byte) bool) ([]int, error) {
+	if lengthSize == 0 {
+		// Without a NAL unit length field size the sample layout is unknown.
+		return nil, nil
+	}
 	var si int
 	idxs := make([]int, 0, 8)
 	for _, chunk := range trackInfo.Chunks {
@@ -624,9 +897,7 @@ func FindIDRFrames(r io.ReadSeeker, trackInfo *TrackInfo) ([]int, error) {
 				for i := 0; i < int(lengthSize); i++ {
 					length = (length << 8) + uint32(data[i])
 				}
-				nalHeader := data[lengthSize]
-				nalType := nalHeader & 0x1f
-				if nalType == 5 {
+				if isRandomAccess(data[lengthSize]) {
 					idxs = append(idxs, si)
 					break
 				}

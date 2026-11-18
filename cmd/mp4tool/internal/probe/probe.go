@@ -75,11 +75,20 @@ type track struct {
 	Encrypted       bool    `yaml:"encrypted"`
 	Width           uint16  `json:",omitempty" yaml:"width,omitempty"`
 	Height          uint16  `json:",omitempty" yaml:"height,omitempty"`
-	SampleNum       int     `json:",omitempty" yaml:"sample_num,omitempty"`
-	ChunkNum        int     `json:",omitempty" yaml:"chunk_num,omitempty"`
-	IDRFrameNum     int     `json:",omitempty" yaml:"idr_frame_num,omitempty"`
-	Bitrate         uint64  `json:",omitempty" yaml:"bitrate,omitempty"`
-	MaxBitrate      uint64  `json:",omitempty" yaml:"max_bitrate,omitempty"`
+	// The profile fields are pointers so that a valid zero value (profile
+	// space 0 for instance) is reported while a configuration that could not
+	// be read is omitted entirely.
+	ProfileSpace         *uint8  `json:",omitempty" yaml:"profile_space,omitempty"`
+	ProfileIDC           *uint8  `json:",omitempty" yaml:"profile_idc,omitempty"`
+	Tier                 *string `json:",omitempty" yaml:"tier,omitempty"`
+	LevelIDC             *uint8  `json:",omitempty" yaml:"level_idc,omitempty"`
+	NALLengthSize        *uint16 `json:",omitempty" yaml:"nal_length_size,omitempty"`
+	SampleNum            int     `json:",omitempty" yaml:"sample_num,omitempty"`
+	ChunkNum             int     `json:",omitempty" yaml:"chunk_num,omitempty"`
+	IDRFrameNum          int     `json:",omitempty" yaml:"idr_frame_num,omitempty"`
+	RandomAccessFrameNum int     `json:",omitempty" yaml:"random_access_frame_num,omitempty"`
+	Bitrate              uint64  `json:",omitempty" yaml:"bitrate,omitempty"`
+	MaxBitrate           uint64  `json:",omitempty" yaml:"max_bitrate,omitempty"`
 }
 
 func buildReport(r io.ReadSeeker) (*report, error) {
@@ -121,30 +130,42 @@ func buildReport(r io.ReadSeeker) (*report, error) {
 		}
 		switch tr.Codec {
 		case mp4.CodecAVC1:
+			t.Codec = tr.CodecString()
 			if tr.AVC != nil {
-				t.Codec = fmt.Sprintf("avc1.%02X%02X%02X",
-					tr.AVC.Profile,
-					tr.AVC.ProfileCompatibility,
-					tr.AVC.Level,
-				)
 				t.Width = tr.AVC.Width
 				t.Height = tr.AVC.Height
-			} else {
-				t.Codec = "avc1"
 			}
 			idxs, err := mp4.FindIDRFrames(r, tr)
 			if err != nil {
 				return nil, err
 			}
 			t.IDRFrameNum = len(idxs)
-		case mp4.CodecMP4A:
-			if tr.MP4A == nil || tr.MP4A.OTI == 0 {
-				t.Codec = "mp4a"
-			} else if tr.MP4A.AudOTI == 0 {
-				t.Codec = fmt.Sprintf("mp4a.%X", tr.MP4A.OTI)
-			} else {
-				t.Codec = fmt.Sprintf("mp4a.%X.%d", tr.MP4A.OTI, tr.MP4A.AudOTI)
+		case mp4.CodecHEVC:
+			t.Codec = tr.CodecString()
+			if tr.HEVC != nil {
+				t.Width = tr.HEVC.Width
+				t.Height = tr.HEVC.Height
+				profileSpace := tr.HEVC.GeneralProfileSpace
+				profileIDC := tr.HEVC.GeneralProfileIdc
+				levelIDC := tr.HEVC.GeneralLevelIdc
+				nalLengthSize := tr.HEVC.LengthSize
+				tier := "L"
+				if tr.HEVC.GeneralTierFlag {
+					tier = "H"
+				}
+				t.ProfileSpace = &profileSpace
+				t.ProfileIDC = &profileIDC
+				t.LevelIDC = &levelIDC
+				t.NALLengthSize = &nalLengthSize
+				t.Tier = &tier
+				idxs, err := mp4.FindRandomAccessFrames(r, tr)
+				if err != nil {
+					return nil, err
+				}
+				t.RandomAccessFrameNum = len(idxs)
 			}
+		case mp4.CodecMP4A:
+			t.Codec = tr.CodecString()
 		default:
 			t.Codec = "unknown"
 		}
